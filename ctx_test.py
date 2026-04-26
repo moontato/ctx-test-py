@@ -338,17 +338,19 @@ CLI flags override values in the config file.
     use_image   = content_choice in ("2", "3")
     multi_image = content_choice == "3"
 
-    # Generate image and measure its token cost once upfront
+    # Generate image and measure its token cost via a real completion request
     image_b64    = None
     image_tokens = 0
     if use_image:
         print(f"  Generating {image_width}×{image_height} test image...", end="", flush=True)
         image_b64 = make_test_image(image_width, image_height)
-        image_tokens = tokenize("[img-1]", images=[image_b64], timeout=timeout)
-        print(f" {image_tokens:,} tokens per image\n")
-        if multi_image and image_tokens == 0:
-            print("ERROR: could not determine image token count — check model supports vision")
+        print(" measuring token cost...", end="", flush=True)
+        resp = send_completion("[img-1]", images=[image_b64], timeout=timeout)
+        if resp is None:
+            print("\nERROR: could not measure image token cost — check model supports vision")
             sys.exit(1)
+        image_tokens = resp.get("tokens_evaluated", 0)
+        print(f" {image_tokens:,} tokens per image\n")
 
     col = "{:<10} {:<12} {:<12} {:<12} {:<10} {:<8}"
     print(col.format("Tokens", "Used GB", "GPU sh GB", "Free GB", "Time (s)", "Status"))
