@@ -84,7 +84,7 @@ def build_prompt(target_tokens: int) -> str:
     reps = (target_tokens // CHUNK_TOKENS) + 10
     return FILL_CHUNK * reps
 
-def send_completion(prompt: str, timeout: int = REQUEST_TIMEOUT) -> dict | None:
+def send_completion(prompt: str, cache: bool = False, timeout: int = REQUEST_TIMEOUT) -> dict | None:
     """
     Send a /completion request with n_predict=1.
     Returns the response dict on success, None on failure.
@@ -93,7 +93,7 @@ def send_completion(prompt: str, timeout: int = REQUEST_TIMEOUT) -> dict | None:
         body = {
             "prompt":        prompt,
             "n_predict":     1,
-            "cache_prompt":  False,
+            "cache_prompt":  cache,
             "temperature":   0.0,
         }
         if MODEL_NAME:
@@ -149,6 +149,16 @@ def main():
         print("ERROR: llama-server is not responding at /health. Is it running?")
         sys.exit(1)
 
+    print("Test mode:")
+    print("  [1] Cold prefill — rebuild prompt each step, no cache (measures worst-case memory)")
+    print("  [2] Incremental  — extend prompt each step, reuse KV cache (faster, lower memory)")
+    while True:
+        choice = input("Choice [1/2]: ").strip()
+        if choice in ("1", "2"):
+            break
+    incremental = choice == "2"
+    print()
+
     # Print header
     col = "{:<10} {:<12} {:<12} {:<12} {:<10} {:<8}"
     print(col.format("Tokens", "Used GB", "GPU sh GB", "Free GB", "Time (s)", "Status"))
@@ -156,20 +166,25 @@ def main():
 
     results = []
     last_success = 0
+    prompt = ""
 
     target = args.start
     while target <= args.max:
 
-        # Build and verify prompt token count
+        # Build or extend prompt
         print(f"  tokenizing {target:,} token prompt...", end="", flush=True)
-        prompt = build_prompt(target)
+        if incremental:
+            extra_tokens = target - (results[-1]["actual_tokens"] if results else 0)
+            extra_reps = (extra_tokens // CHUNK_TOKENS) + 10
+            prompt += FILL_CHUNK * extra_reps
+        else:
+            prompt = build_prompt(target)
         actual_tokens = tokenize(prompt)
         print(f" got {actual_tokens:,}", flush=True)
 
-        # Trim or pad to get closer to target
+        # Trim to get closer to target
         if actual_tokens > target + 500:
-            # Trim by removing chunks from the end
-            while actual_tokens > target and len(prompt) > FILL_CHUNK:
+            while actual_tokens > target and len(prompt) > len(FILL_CHUNK):
                 prompt = prompt[:-len(FILL_CHUNK)]
                 actual_tokens -= CHUNK_TOKENS
         
@@ -188,7 +203,7 @@ def main():
 
         # Send request and time it
         t_start = time.time()
-        response = send_completion(prompt)
+        response = send_completion(prompt, cache=incremental)
         elapsed = time.time() - t_start
 
         # Memory after request
