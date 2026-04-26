@@ -24,11 +24,11 @@ from datetime import datetime
 
 LLAMA_URL    = "http://127.0.0.1:8080"
 MODEL_NAME   = ""          # required in router mode — set to your model alias
-START_TOKENS = 8_000       # first test size
-STEP_TOKENS  = 8_000       # increment per step
-MAX_TOKENS   = 256_000     # hard ceiling (your ctx-size)
-MEM_THRESHOLD_GB = 58.0    # stop before OOM — set to ~90% of your total RAM
-REQUEST_TIMEOUT  = 300     # seconds to wait for a single completion
+START_TOKENS = 50_000       # first test size
+STEP_TOKENS  = 25_000       # increment per step
+MAX_TOKENS   = 525_000     # hard ceiling (your ctx-size)
+MEM_THRESHOLD_GB = 54.0    # stop before OOM — set to ~90% of your total RAM
+REQUEST_TIMEOUT  = 600     # seconds to wait for a single completion
 
 # Repeated chunk for building prompts — "the " = 2 tokens reliably
 FILL_CHUNK = "the quick brown fox jumps over the lazy dog . " * 1
@@ -120,6 +120,7 @@ def check_health() -> bool:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    global LLAMA_URL, MODEL_NAME
     parser = argparse.ArgumentParser(description="Test llama-server context limits")
     parser.add_argument("--url",       default=LLAMA_URL,          help="llama-server base URL")
     parser.add_argument("--model",     default=MODEL_NAME,         help="Model alias (required in router mode)")
@@ -130,7 +131,6 @@ def main():
     parser.add_argument("--no-jtop",   action="store_true",         help="Skip jtop (if not on Jetson)")
     args = parser.parse_args()
 
-    global LLAMA_URL, MODEL_NAME
     LLAMA_URL  = args.url
     MODEL_NAME = args.model
 
