@@ -6,34 +6,36 @@ Sends increasingly large prompts (linear steps) and records memory usage at
 each step via jtop. Stops on first failure or when memory exceeds a threshold.
 
 Usage:
-    python3 ctx_test.py [--url URL] [--start N] [--step N] [--max N] [--threshold N]
+    ./ctx_test.py --config myconfig.ini
+    ./ctx_test.py --url http://127.0.0.1:8080 --model my-alias
+    ./ctx_test.py --config myconfig.ini --step 16000  # CLI overrides ini
 
 Requirements:
-    pip install jetson-stats requests --break-system-packages
+    pip install requests --break-system-packages
+    pip install jetson-stats --break-system-packages  (Jetson only)
 """
 
 from __future__ import annotations
 import argparse
-import hashlib
+import configparser
 import json
 import time
 import sys
 import requests
 from datetime import datetime
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# Internal prompt-building constants — not user config
+FILL_CHUNK   = "the quick brown fox jumps over the lazy dog . "
+CHUNK_TOKENS = 10  # approximate tokens per repetition of FILL_CHUNK
 
-LLAMA_URL    = "http://127.0.0.1:8080"
-MODEL_NAME   = ""          # required in router mode — set to your model alias
-START_TOKENS = 50_000       # first test size
-STEP_TOKENS  = 25_000       # increment per step
-MAX_TOKENS   = 525_000     # hard ceiling (your ctx-size)
-MEM_THRESHOLD_GB = 54.0    # stop before OOM — set to ~90% of your total RAM
-REQUEST_TIMEOUT  = 600     # seconds to wait for a single completion
-
-# Repeated chunk for building prompts — "the " = 2 tokens reliably
-FILL_CHUNK = "the quick brown fox jumps over the lazy dog . " * 1
-CHUNK_TOKENS = 10  # approximate tokens per chunk above
+# Defaults for optional settings
+_DEFAULTS = {
+    "start":     8_000,
+    "step":      8_000,
+    "max":       256_000,
+    "threshold": 58.0,
+    "timeout":   300,
+}
 
 # ── jtop memory helper ────────────────────────────────────────────────────────
 
@@ -54,12 +56,15 @@ def get_memory_gb():
                     free_kb   / 1024 / 1024,
                 )
     except ModuleNotFoundError:
-        print("  [jtop error: module not found — run with system python3, or use --no-jtop]")
+        print("  [jtop error: module not found — install jetson-stats or use --no-jtop]")
     except Exception as e:
         print(f"  [jtop error: {e}]")
     return (0.0, 0.0, 0.0)
 
 # ── llama-server helpers ──────────────────────────────────────────────────────
+
+LLAMA_URL  = ""
+MODEL_NAME = ""
 
 def tokenize(text: str) -> int:
     """Return actual token count from llama-server /tokenize endpoint."""
@@ -67,11 +72,7 @@ def tokenize(text: str) -> int:
         body = {"content": text}
         if MODEL_NAME:
             body["model"] = MODEL_NAME
-        r = requests.post(
-            f"{LLAMA_URL}/tokenize",
-            json=body,
-            timeout=30,
-        )
+        r = requests.post(f"{LLAMA_URL}/tokenize", json=body, timeout=30)
         r.raise_for_status()
         return len(r.json().get("tokens", []))
     except Exception as e:
@@ -79,30 +80,20 @@ def tokenize(text: str) -> int:
         return 0
 
 def build_prompt(target_tokens: int) -> str:
-    """Build a prompt of approximately target_tokens tokens."""
-    # Rough estimate first, then trim
     reps = (target_tokens // CHUNK_TOKENS) + 10
     return FILL_CHUNK * reps
 
-def send_completion(prompt: str, cache: bool = False, timeout: int = REQUEST_TIMEOUT) -> dict | None:
-    """
-    Send a /completion request with n_predict=1.
-    Returns the response dict on success, None on failure.
-    """
+def send_completion(prompt: str, cache: bool = False, timeout: int = _DEFAULTS["timeout"]) -> dict | None:
     try:
         body = {
-            "prompt":        prompt,
-            "n_predict":     1,
-            "cache_prompt":  cache,
-            "temperature":   0.0,
+            "prompt":       prompt,
+            "n_predict":    1,
+            "cache_prompt": cache,
+            "temperature":  0.0,
         }
         if MODEL_NAME:
             body["model"] = MODEL_NAME
-        r = requests.post(
-            f"{LLAMA_URL}/completion",
-            json=body,
-            timeout=timeout,
-        )
+        r = requests.post(f"{LLAMA_URL}/completion", json=body, timeout=timeout)
         r.raise_for_status()
         return r.json()
     except requests.exceptions.Timeout:
@@ -120,28 +111,78 @@ def check_health() -> bool:
     except Exception:
         return False
 
+# ── Config loading ────────────────────────────────────────────────────────────
+
+def load_ini(path: str) -> dict:
+    cp = configparser.ConfigParser()
+    if not cp.read(path):
+        print(f"ERROR: could not read config file: {path}")
+        sys.exit(1)
+    section = "ctx_test"
+    if section not in cp:
+        print(f"ERROR: config file must contain a [{section}] section")
+        sys.exit(1)
+    return dict(cp[section])
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     global LLAMA_URL, MODEL_NAME
-    parser = argparse.ArgumentParser(description="Test llama-server context limits")
-    parser.add_argument("--url",       default=LLAMA_URL,          help="llama-server base URL")
-    parser.add_argument("--model",     default=MODEL_NAME,         help="Model alias (required in router mode)")
-    parser.add_argument("--start",     type=int, default=START_TOKENS,   help="Starting token count")
-    parser.add_argument("--step",      type=int, default=STEP_TOKENS,    help="Token increment per step")
-    parser.add_argument("--max",       type=int, default=MAX_TOKENS,     help="Maximum tokens to test")
-    parser.add_argument("--threshold", type=float, default=MEM_THRESHOLD_GB, help="Stop if memory exceeds this GB")
-    parser.add_argument("--no-jtop",   action="store_true",         help="Skip jtop (if not on Jetson)")
+
+    parser = argparse.ArgumentParser(
+        description="Test llama-server context limits",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Config file format (--config myconfig.ini):
+  [ctx_test]
+  url       = http://127.0.0.1:8080
+  model     = my-model-alias
+  start     = 8000
+  step      = 8000
+  max       = 256000
+  threshold = 58.0
+  timeout   = 300
+
+CLI flags override values in the config file.
+'url' and 'model' are required — from config file or flags.
+        """,
+    )
+    parser.add_argument("--config",    help="Path to .ini config file")
+    parser.add_argument("--url",       help="llama-server base URL")
+    parser.add_argument("--model",     help="Model alias (required in router mode)")
+    parser.add_argument("--start",     type=int,   help=f"Starting token count (default: {_DEFAULTS['start']:,})")
+    parser.add_argument("--step",      type=int,   help=f"Token increment per step (default: {_DEFAULTS['step']:,})")
+    parser.add_argument("--max",       type=int,   help=f"Maximum tokens to test (default: {_DEFAULTS['max']:,})")
+    parser.add_argument("--threshold", type=float, help=f"Stop if used memory exceeds this GB (default: {_DEFAULTS['threshold']})")
+    parser.add_argument("--timeout",   type=int,   help=f"Request timeout in seconds (default: {_DEFAULTS['timeout']})")
+    parser.add_argument("--no-jtop",   action="store_true", help="Skip jtop memory readings (if not on Jetson)")
     args = parser.parse_args()
 
-    LLAMA_URL  = args.url
-    MODEL_NAME = args.model
+    # Load ini if provided, then layer: CLI > ini > defaults
+    ini = load_ini(args.config) if args.config else {}
+
+    url       = args.url       or ini.get("url")
+    model     = args.model     or ini.get("model", "")
+    start     = args.start     or int(ini.get("start",     _DEFAULTS["start"]))
+    step      = args.step      or int(ini.get("step",      _DEFAULTS["step"]))
+    max_tok   = args.max       or int(ini.get("max",       _DEFAULTS["max"]))
+    threshold = args.threshold or float(ini.get("threshold", _DEFAULTS["threshold"]))
+    timeout   = args.timeout   or int(ini.get("timeout",   _DEFAULTS["timeout"]))
+
+    if not url:
+        parser.error("'url' is required — pass --url or set it in a --config .ini file")
+    if not model:
+        parser.error("'model' is required — pass --model or set it in a --config .ini file")
+
+    LLAMA_URL  = url
+    MODEL_NAME = model
 
     print(f"\n{'='*70}")
     print(f"  llama-server context limit test")
     print(f"  URL: {LLAMA_URL}")
-    print(f"  Range: {args.start:,} → {args.max:,} tokens, step {args.step:,}")
-    print(f"  Memory stop threshold: {args.threshold} GB")
+    print(f"  Model: {MODEL_NAME}")
+    print(f"  Range: {start:,} → {max_tok:,} tokens, step {step:,}")
+    print(f"  Memory stop threshold: {threshold} GB")
     print(f"  Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*70}\n")
 
@@ -159,7 +200,6 @@ def main():
     incremental = choice == "2"
     print()
 
-    # Print header
     col = "{:<10} {:<12} {:<12} {:<12} {:<10} {:<8}"
     print(col.format("Tokens", "Used GB", "GPU sh GB", "Free GB", "Time (s)", "Status"))
     print("-" * 70)
@@ -168,10 +208,9 @@ def main():
     last_success = 0
     prompt = ""
 
-    target = args.start
-    while target <= args.max:
+    target = start
+    while target <= max_tok:
 
-        # Build or extend prompt
         print(f"  tokenizing {target:,} token prompt...", end="", flush=True)
         if incremental:
             extra_tokens = target - (results[-1]["actual_tokens"] if results else 0)
@@ -182,37 +221,29 @@ def main():
         actual_tokens = tokenize(prompt)
         print(f" got {actual_tokens:,}", flush=True)
 
-        # Trim to get closer to target
         if actual_tokens > target + 500:
             while actual_tokens > target and len(prompt) > len(FILL_CHUNK):
                 prompt = prompt[:-len(FILL_CHUNK)]
                 actual_tokens -= CHUNK_TOKENS
-        
-        # Memory before request
+
         if not args.no_jtop:
             used_before, _, _ = get_memory_gb()
         else:
             used_before = 0.0
 
-        # Check threshold before even sending
-        total_before = used_before
-        if total_before >= args.threshold:
-            print(f"\nSTOP: Memory {total_before:.1f} GB already at/above threshold "
-                  f"{args.threshold} GB before sending request.")
+        if used_before >= threshold:
+            print(f"\nSTOP: Memory {used_before:.1f} GB already at/above threshold "
+                  f"{threshold} GB before sending request.")
             break
 
-        # Send request and time it
         t_start = time.time()
-        response = send_completion(prompt, cache=incremental)
+        response = send_completion(prompt, cache=incremental, timeout=timeout)
         elapsed = time.time() - t_start
 
-        # Memory after request
         if not args.no_jtop:
             used_after, gpu_after, free_after = get_memory_gb()
         else:
             used_after = gpu_after = free_after = 0.0
-
-        total_after = used_after
 
         if response is not None:
             tokens_evaluated = response.get("tokens_evaluated", actual_tokens)
@@ -227,14 +258,14 @@ def main():
                 status,
             ))
             results.append({
-                "target_tokens":    target,
-                "actual_tokens":    tokens_evaluated,
-                "used_gb":          used_after,
-                "gpu_shared_gb":    gpu_after,
-                "free_gb":          free_after,
-                "total_gb":         total_after,
-                "elapsed_s":        elapsed,
-                "success":          True,
+                "target_tokens": target,
+                "actual_tokens": tokens_evaluated,
+                "used_gb":       used_after,
+                "gpu_shared_gb": gpu_after,
+                "free_gb":       free_after,
+                "total_gb":      used_after,
+                "elapsed_s":     elapsed,
+                "success":       True,
             })
         else:
             status = "FAIL"
@@ -247,27 +278,25 @@ def main():
                 status,
             ))
             results.append({
-                "target_tokens":    target,
-                "actual_tokens":    actual_tokens,
-                "used_gb":          used_after,
-                "gpu_shared_gb":    gpu_after,
-                "free_gb":          free_after,
-                "total_gb":         total_after,
-                "elapsed_s":        elapsed,
-                "success":          False,
+                "target_tokens": target,
+                "actual_tokens": actual_tokens,
+                "used_gb":       used_after,
+                "gpu_shared_gb": gpu_after,
+                "free_gb":       free_after,
+                "total_gb":      used_after,
+                "elapsed_s":     elapsed,
+                "success":       False,
             })
             print(f"\nSTOP: Request failed at {target:,} tokens.")
             break
 
-        # Check threshold after request
-        if total_after >= args.threshold:
-            print(f"\nSTOP: Memory {total_after:.1f} GB hit threshold "
-                  f"{args.threshold} GB after {target:,} token request.")
+        if used_after >= threshold:
+            print(f"\nSTOP: Memory {used_after:.1f} GB hit threshold "
+                  f"{threshold} GB after {target:,} token request.")
             break
 
-        target += args.step
+        target += step
 
-    # Summary
     print(f"\n{'='*70}")
     print(f"  Results summary")
     print(f"{'='*70}")
@@ -278,25 +307,25 @@ def main():
         failed     = [r for r in results if not r["success"]]
         if successful:
             peak_mem = max(r["total_gb"] for r in successful)
-            print(f"  Peak memory (used + GPU sh): {peak_mem:.2f} GB")
-            print(f"  Memory at baseline ({args.start:,} tokens): "
-                  f"{successful[0]['total_gb']:.2f} GB")
+            print(f"  Peak memory (used GB): {peak_mem:.2f} GB")
+            print(f"  Memory at baseline ({start:,} tokens): {successful[0]['total_gb']:.2f} GB")
             if len(successful) > 1:
                 growth = successful[-1]["total_gb"] - successful[0]["total_gb"]
                 print(f"  Memory growth over test: {growth:.2f} GB")
         if failed:
             print(f"  Failed at: {failed[0]['target_tokens']:,} tokens")
 
-    # Save results to JSON
     out_file = f"ctx_test_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     with open(out_file, "w") as f:
         json.dump({
             "config": {
-                "url":       args.url,
-                "start":     args.start,
-                "step":      args.step,
-                "max":       args.max,
-                "threshold": args.threshold,
+                "url":       url,
+                "model":     model,
+                "start":     start,
+                "step":      step,
+                "max":       max_tok,
+                "threshold": threshold,
+                "timeout":   timeout,
                 "timestamp": datetime.now().isoformat(),
             },
             "results": results,
