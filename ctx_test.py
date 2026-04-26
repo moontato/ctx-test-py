@@ -66,13 +66,13 @@ def get_memory_gb():
 LLAMA_URL  = ""
 MODEL_NAME = ""
 
-def tokenize(text: str) -> int:
+def tokenize(text: str, timeout: int = 120) -> int:
     """Return actual token count from llama-server /tokenize endpoint."""
     try:
         body = {"content": text}
         if MODEL_NAME:
             body["model"] = MODEL_NAME
-        r = requests.post(f"{LLAMA_URL}/tokenize", json=body, timeout=30)
+        r = requests.post(f"{LLAMA_URL}/tokenize", json=body, timeout=timeout)
         r.raise_for_status()
         return len(r.json().get("tokens", []))
     except Exception as e:
@@ -218,7 +218,7 @@ CLI flags override values in the config file.
             prompt += FILL_CHUNK * extra_reps
         else:
             prompt = build_prompt(target)
-        actual_tokens = tokenize(prompt)
+        actual_tokens = tokenize(prompt, timeout=timeout)
         print(f" got {actual_tokens:,}", flush=True)
 
         if actual_tokens > target + 500:
