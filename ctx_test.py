@@ -48,10 +48,10 @@ def get_memory_gb():
         with jtop() as jetson:
             if jetson.ok():
                 ram = jetson.memory["RAM"]
-                # values are in KB
+                # values are in KB; free = tot - used matches jtop header display
                 used_kb   = ram["used"]
                 shared_kb = ram["shared"]
-                free_kb   = ram["free"]
+                free_kb   = ram["tot"] - ram["used"]
                 return (
                     used_kb   / 1024 / 1024,
                     shared_kb / 1024 / 1024,
