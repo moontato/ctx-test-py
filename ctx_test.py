@@ -74,14 +74,14 @@ LLAMA_URL  = ""
 MODEL_NAME = ""
 
 
-def tokenize(text: str, image_b64: str | None = None, timeout: int = 120) -> int:
+def tokenize(text: str, images: list[str] | None = None, timeout: int = 120) -> int:
     """Return actual token count from llama-server /tokenize endpoint."""
     try:
         body = {"content": text}
         if MODEL_NAME:
             body["model"] = MODEL_NAME
-        if image_b64:
-            body["image_data"] = [{"data": image_b64, "id": 1}]
+        if images:
+            body["image_data"] = [{"data": b64, "id": i + 1} for i, b64 in enumerate(images)]
         r = requests.post(f"{LLAMA_URL}/tokenize", json=body, timeout=timeout)
         r.raise_for_status()
         return len(r.json().get("tokens", []))
@@ -127,7 +127,7 @@ _session.mount("https://", _KeepaliveAdapter())
 
 def send_completion(
     prompt: str,
-    image_b64: str | None = None,
+    images: list[str] | None = None,
     cache: bool = False,
     timeout: int = _DEFAULTS["timeout"],
 ) -> dict | None:
@@ -140,8 +140,8 @@ def send_completion(
         }
         if MODEL_NAME:
             body["model"] = MODEL_NAME
-        if image_b64:
-            body["image_data"] = [{"data": image_b64, "id": 1}]
+        if images:
+            body["image_data"] = [{"data": b64, "id": i + 1} for i, b64 in enumerate(images)]
         r = _session.post(f"{LLAMA_URL}/completion", json=body, timeout=timeout)
         r.raise_for_status()
         return r.json()
@@ -178,7 +178,7 @@ def load_ini(path: str) -> dict:
 
 def run_step(
     prompt: str,
-    image_b64: str | None,
+    images: list[str] | None,
     target: int,
     actual_tokens: int,
     incremental: bool,
@@ -199,7 +199,7 @@ def run_step(
         return None
 
     t_start = time.time()
-    response = send_completion(prompt, image_b64=image_b64, cache=incremental, timeout=timeout)
+    response = send_completion(prompt, images=images, cache=incremental, timeout=timeout)
     elapsed = time.time() - t_start
 
     if not no_jtop:
@@ -314,8 +314,8 @@ CLI flags override values in the config file.
     print()
     print("Content mode:")
     print("  [1] Text only")
-    print("  [2] Image + text  — one synthetic image injected per request")
-    print("  [3] Compare       — runs text-only then image+text each step, shows delta")
+    print("  [2] Image + text  — one synthetic image + text fill per request")
+    print("  [3] Multi-image   — scale image count each step, no text (worst-case)")
     while True:
         content_choice = input("Choice [1/2/3]: ").strip()
         if content_choice in ("1", "2", "3"):
@@ -323,7 +323,7 @@ CLI flags override values in the config file.
     print()
 
     use_image   = content_choice in ("2", "3")
-    compare     = content_choice == "3"
+    multi_image = content_choice == "3"
 
     # Generate image and measure its token cost once upfront
     image_b64    = None
@@ -331,16 +331,15 @@ CLI flags override values in the config file.
     if use_image:
         print(f"  Generating {image_width}×{image_height} test image...", end="", flush=True)
         image_b64 = make_test_image(image_width, image_height)
-        image_tokens = tokenize("[img-1]", image_b64=image_b64, timeout=timeout)
-        print(f" {image_tokens:,} tokens\n")
+        image_tokens = tokenize("[img-1]", images=[image_b64], timeout=timeout)
+        print(f" {image_tokens:,} tokens per image\n")
+        if multi_image and image_tokens == 0:
+            print("ERROR: could not determine image token count — check model supports vision")
+            sys.exit(1)
 
     col = "{:<10} {:<12} {:<12} {:<12} {:<10} {:<8}"
-    if compare:
-        print(col.format("Tokens", "Used GB", "GPU sh GB", "Free GB", "Time (s)", "Type"))
-        print(f"  {'─'*66}")
-    else:
-        print(col.format("Tokens", "Used GB", "GPU sh GB", "Free GB", "Time (s)", "Status"))
-        print("-" * 70)
+    print(col.format("Tokens", "Used GB", "GPU sh GB", "Free GB", "Time (s)", "Status"))
+    print("-" * 70)
 
     results      = []
     last_success = 0
@@ -349,75 +348,76 @@ CLI flags override values in the config file.
     target = start
     while target <= max_tok:
 
-        # ── build / extend text prompt ────────────────────────────────────────
         print(f"  tokenizing {target:,} token prompt...", end="", flush=True)
-        if incremental and not compare:
-            prev_tokens  = results[-1]["actual_tokens"] if results else 0
-            extra_tokens = target - prev_tokens - (image_tokens if use_image else 0)
-            extra_reps   = (extra_tokens // CHUNK_TOKENS) + 10
-            text_prompt += FILL_CHUNK * extra_reps
-        else:
-            text_prompt = build_prompt(target, reserve_tokens=image_tokens if use_image else 0)
 
-        if use_image:
-            full_prompt = "[img-1]\n" + text_prompt
-            actual_tokens = tokenize(full_prompt, image_b64=image_b64, timeout=timeout)
-        else:
-            full_prompt   = text_prompt
-            actual_tokens = tokenize(full_prompt, timeout=timeout)
-        print(f" got {actual_tokens:,}", flush=True)
+        # ── multi-image: scale image count, no text ───────────────────────────
+        if multi_image:
+            num_images  = max(1, target // image_tokens)
+            imgs        = [image_b64] * num_images
+            full_prompt = "\n".join(f"[img-{i+1}]" for i in range(num_images))
+            actual_tokens = tokenize(full_prompt, images=imgs, timeout=timeout)
+            print(f" got {actual_tokens:,} ({num_images} images)", flush=True)
 
-        # trim if over by more than 500
-        if actual_tokens > target + 500:
-            while actual_tokens > target and len(text_prompt) > len(FILL_CHUNK):
-                text_prompt    = text_prompt[:-len(FILL_CHUNK)]
-                actual_tokens -= CHUNK_TOKENS
-            full_prompt = ("[img-1]\n" + text_prompt) if use_image else text_prompt
-
-        # ── compare mode: run text-only first, then image+text ────────────────
-        if compare:
-            text_only_prompt = build_prompt(target)
-            text_only_tokens = tokenize(text_only_prompt, timeout=timeout)
-
-            print(f"  {'─'*66}")
-            print(f"  text-only:")
-            result_text = run_step(
-                text_only_prompt, None, target, text_only_tokens,
-                False, threshold, timeout, args.no_jtop, "  " + col,
+            result = run_step(
+                full_prompt, imgs, target, actual_tokens,
+                False, threshold, timeout, args.no_jtop, col,
             )
-            if result_text is None:
+            if result is None:
+                break
+            result["num_images"] = num_images
+            results.append(result)
+
+            if not result["success"]:
+                print(f"\nSTOP: Request failed at {target:,} tokens ({num_images} images).")
                 break
 
-            print(f"  image+text:")
-            result_img = run_step(
-                full_prompt, image_b64, target, actual_tokens,
-                False, threshold, timeout, args.no_jtop, "  " + col,
-            )
-            if result_img is None:
-                break
+            last_success = result["actual_tokens"]
 
-            if result_text["success"] and result_img["success"]:
-                delta = result_img["used_gb"] - result_text["used_gb"]
-                print(f"  Memory delta (image vs text): {delta:+.2f} GB")
+            if len(results) >= 2:
+                prev      = results[-2]
+                gb_delta  = results[-1]["used_gb"] - prev["used_gb"]
+                tok_delta = results[-1]["actual_tokens"] - prev["actual_tokens"]
+                if gb_delta > 0 and tok_delta > 0:
+                    gb_per_tok    = gb_delta / tok_delta
+                    headroom      = threshold - result["used_gb"]
+                    predicted_max = int(result["actual_tokens"] + headroom / gb_per_tok)
+                    print(f"  Predicted max: ~{predicted_max:,} tokens (~{predicted_max // image_tokens} images) "
+                          f"({gb_per_tok*1000:.3f} MB/tok, {headroom:.2f} GB headroom)")
 
-            result_text["content"] = "text"
-            result_img["content"]  = "image"
-            results.append(result_text)
-            results.append(result_img)
-
-            if not result_text["success"] or not result_img["success"]:
-                print(f"\nSTOP: Request failed at {target:,} tokens.")
-                break
-
-            if result_img["used_gb"] >= threshold:
-                print(f"\nSTOP: Memory {result_img['used_gb']:.1f} GB hit threshold "
+            if result["used_gb"] >= threshold:
+                print(f"\nSTOP: Memory {result['used_gb']:.1f} GB hit threshold "
                       f"{threshold} GB after {target:,} token request.")
                 break
 
-        # ── single mode (text-only or image+text) ─────────────────────────────
+        # ── single mode: text-only or image+text ─────────────────────────────
         else:
+            if use_image:
+                if incremental:
+                    prev_tokens  = results[-1]["actual_tokens"] if results else 0
+                    extra_tokens = target - prev_tokens - image_tokens
+                    text_prompt += FILL_CHUNK * ((extra_tokens // CHUNK_TOKENS) + 10)
+                else:
+                    text_prompt = build_prompt(target, reserve_tokens=image_tokens)
+                full_prompt   = "[img-1]\n" + text_prompt
+                actual_tokens = tokenize(full_prompt, images=[image_b64], timeout=timeout)
+            else:
+                if incremental:
+                    extra_tokens = target - (results[-1]["actual_tokens"] if results else 0)
+                    text_prompt += FILL_CHUNK * ((extra_tokens // CHUNK_TOKENS) + 10)
+                else:
+                    text_prompt = build_prompt(target)
+                full_prompt   = text_prompt
+                actual_tokens = tokenize(full_prompt, timeout=timeout)
+            print(f" got {actual_tokens:,}", flush=True)
+
+            if actual_tokens > target + 500:
+                while actual_tokens > target and len(text_prompt) > len(FILL_CHUNK):
+                    text_prompt    = text_prompt[:-len(FILL_CHUNK)]
+                    actual_tokens -= CHUNK_TOKENS
+                full_prompt = ("[img-1]\n" + text_prompt) if use_image else text_prompt
+
             result = run_step(
-                full_prompt, image_b64 if use_image else None,
+                full_prompt, [image_b64] if use_image else None,
                 target, actual_tokens,
                 incremental, threshold, timeout, args.no_jtop, col,
             )
@@ -455,30 +455,22 @@ CLI flags override values in the config file.
     print(f"  Results summary")
     print(f"{'='*70}")
 
-    if compare:
-        text_results  = [r for r in results if r.get("content") == "text"  and r["success"]]
-        image_results = [r for r in results if r.get("content") == "image" and r["success"]]
-        if text_results and image_results:
-            avg_delta = sum(
-                i["used_gb"] - t["used_gb"]
-                for t, i in zip(text_results, image_results)
-            ) / len(text_results)
-            print(f"  Steps completed: {len(text_results)}")
-            print(f"  Avg memory delta (image vs text): {avg_delta:+.2f} GB")
-            print(f"  Image size: {image_width}×{image_height}px ({image_tokens:,} tokens)")
-    else:
-        print(f"  Last successful context: {last_success:,} tokens")
+    print(f"  Last successful context: {last_success:,} tokens")
+    if multi_image and results:
         successful = [r for r in results if r["success"]]
-        failed     = [r for r in results if not r["success"]]
         if successful:
-            peak_mem = max(r["total_gb"] for r in successful)
-            print(f"  Peak memory (used GB): {peak_mem:.2f} GB")
-            print(f"  Memory at baseline ({start:,} tokens): {successful[0]['total_gb']:.2f} GB")
-            if len(successful) > 1:
-                growth = successful[-1]["total_gb"] - successful[0]["total_gb"]
-                print(f"  Memory growth over test: {growth:.2f} GB")
-        if failed:
-            print(f"  Failed at: {failed[0]['target_tokens']:,} tokens")
+            print(f"  Max images processed: {successful[-1].get('num_images', '?')}")
+    successful = [r for r in results if r["success"]]
+    failed     = [r for r in results if not r["success"]]
+    if successful:
+        peak_mem = max(r["total_gb"] for r in successful)
+        print(f"  Peak memory (used GB): {peak_mem:.2f} GB")
+        print(f"  Memory at baseline ({start:,} tokens): {successful[0]['total_gb']:.2f} GB")
+        if len(successful) > 1:
+            growth = successful[-1]["total_gb"] - successful[0]["total_gb"]
+            print(f"  Memory growth over test: {growth:.2f} GB")
+    if failed:
+        print(f"  Failed at: {failed[0]['target_tokens']:,} tokens")
 
     out_file = f"ctx_test_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     with open(out_file, "w") as f:
