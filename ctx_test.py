@@ -13,11 +13,14 @@ Usage:
 Requirements:
     pip install requests --break-system-packages
     pip install jetson-stats --break-system-packages  (Jetson only)
+    pip install Pillow --break-system-packages         (image modes only)
 """
 
 from __future__ import annotations
 import argparse
+import base64
 import configparser
+import io
 import json
 import socket
 import time
@@ -32,11 +35,13 @@ CHUNK_TOKENS = 10  # approximate tokens per repetition of FILL_CHUNK
 
 # Defaults for optional settings
 _DEFAULTS = {
-    "start":     8_000,
-    "step":      8_000,
-    "max":       256_000,
-    "threshold": 58.0,
-    "timeout":   1800,
+    "start":        8_000,
+    "step":         8_000,
+    "max":          256_000,
+    "threshold":    58.0,
+    "timeout":      1800,
+    "image_width":  448,
+    "image_height": 448,
 }
 
 # ── jtop memory helper ────────────────────────────────────────────────────────
@@ -68,12 +73,15 @@ def get_memory_gb():
 LLAMA_URL  = ""
 MODEL_NAME = ""
 
-def tokenize(text: str, timeout: int = 120) -> int:
+
+def tokenize(text: str, image_b64: str | None = None, timeout: int = 120) -> int:
     """Return actual token count from llama-server /tokenize endpoint."""
     try:
         body = {"content": text}
         if MODEL_NAME:
             body["model"] = MODEL_NAME
+        if image_b64:
+            body["image_data"] = [{"data": image_b64, "id": 1}]
         r = requests.post(f"{LLAMA_URL}/tokenize", json=body, timeout=timeout)
         r.raise_for_status()
         return len(r.json().get("tokens", []))
@@ -81,9 +89,25 @@ def tokenize(text: str, timeout: int = 120) -> int:
         print(f"  [tokenize error: {e}]")
         return 0
 
-def build_prompt(target_tokens: int) -> str:
-    reps = (target_tokens // CHUNK_TOKENS) + 10
+
+def build_prompt(target_tokens: int, reserve_tokens: int = 0) -> str:
+    """Build a text prompt of approximately (target_tokens - reserve_tokens) tokens."""
+    reps = ((target_tokens - reserve_tokens) // CHUNK_TOKENS) + 10
     return FILL_CHUNK * reps
+
+
+def make_test_image(width: int = 448, height: int = 448) -> str:
+    """Generate a solid grey PNG and return it as a base64 string."""
+    try:
+        from PIL import Image
+    except ImportError:
+        print("ERROR: Pillow is required for image modes — pip install Pillow")
+        sys.exit(1)
+    img = Image.new("RGB", (width, height), color=(128, 128, 128))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
 
 class _KeepaliveAdapter(HTTPAdapter):
     def init_poolmanager(self, *args, **kwargs):
@@ -101,7 +125,12 @@ _session.mount("http://",  _KeepaliveAdapter())
 _session.mount("https://", _KeepaliveAdapter())
 
 
-def send_completion(prompt: str, cache: bool = False, timeout: int = _DEFAULTS["timeout"]) -> dict | None:
+def send_completion(
+    prompt: str,
+    image_b64: str | None = None,
+    cache: bool = False,
+    timeout: int = _DEFAULTS["timeout"],
+) -> dict | None:
     try:
         body = {
             "prompt":       prompt,
@@ -111,6 +140,8 @@ def send_completion(prompt: str, cache: bool = False, timeout: int = _DEFAULTS["
         }
         if MODEL_NAME:
             body["model"] = MODEL_NAME
+        if image_b64:
+            body["image_data"] = [{"data": image_b64, "id": 1}]
         r = _session.post(f"{LLAMA_URL}/completion", json=body, timeout=timeout)
         r.raise_for_status()
         return r.json()
@@ -121,6 +152,7 @@ def send_completion(prompt: str, cache: bool = False, timeout: int = _DEFAULTS["
     except Exception as e:
         print(f"  [request error: {e}]")
     return None
+
 
 def check_health() -> bool:
     try:
@@ -142,6 +174,63 @@ def load_ini(path: str) -> dict:
         sys.exit(1)
     return dict(cp[section])
 
+# ── Step runner ───────────────────────────────────────────────────────────────
+
+def run_step(
+    prompt: str,
+    image_b64: str | None,
+    target: int,
+    actual_tokens: int,
+    incremental: bool,
+    threshold: float,
+    timeout: int,
+    no_jtop: bool,
+    col: str,
+) -> dict | None:
+    """Run a single completion step. Returns result dict or None on threshold stop."""
+    if not no_jtop:
+        used_before, _, _ = get_memory_gb()
+    else:
+        used_before = 0.0
+
+    if used_before >= threshold:
+        print(f"\nSTOP: Memory {used_before:.1f} GB already at/above threshold "
+              f"{threshold} GB before sending request.")
+        return None
+
+    t_start = time.time()
+    response = send_completion(prompt, image_b64=image_b64, cache=incremental, timeout=timeout)
+    elapsed = time.time() - t_start
+
+    if not no_jtop:
+        used_after, gpu_after, free_after = get_memory_gb()
+    else:
+        used_after = gpu_after = free_after = 0.0
+
+    success = response is not None
+    tokens_evaluated = response.get("tokens_evaluated", actual_tokens) if success else actual_tokens
+    status = "OK" if success else "FAIL"
+
+    print(col.format(
+        f"{tokens_evaluated:,}",
+        f"{used_after:.2f}",
+        f"{gpu_after:.2f}",
+        f"{free_after:.2f}",
+        f"{elapsed:.1f}",
+        status,
+    ))
+
+    return {
+        "target_tokens": target,
+        "actual_tokens": tokens_evaluated,
+        "used_gb":       used_after,
+        "gpu_shared_gb": gpu_after,
+        "free_gb":       free_after,
+        "total_gb":      used_after,
+        "elapsed_s":     elapsed,
+        "success":       success,
+    }
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -153,39 +242,44 @@ def main():
         epilog="""
 Config file format (--config myconfig.ini):
   [ctx_test]
-  url       = http://127.0.0.1:8080
-  model     = my-model-alias
-  start     = 8000
-  step      = 8000
-  max       = 256000
-  threshold = 58.0
-  timeout   = 300
+  url          = http://127.0.0.1:8080
+  model        = my-model-alias
+  start        = 8000
+  step         = 8000
+  max          = 256000
+  threshold    = 58.0
+  timeout      = 1800
+  image_width  = 448
+  image_height = 448
 
 CLI flags override values in the config file.
 'url' and 'model' are required — from config file or flags.
         """,
     )
-    parser.add_argument("--config",    help="Path to .ini config file")
-    parser.add_argument("--url",       help="llama-server base URL")
-    parser.add_argument("--model",     help="Model alias (required in router mode)")
-    parser.add_argument("--start",     type=int,   help=f"Starting token count (default: {_DEFAULTS['start']:,})")
-    parser.add_argument("--step",      type=int,   help=f"Token increment per step (default: {_DEFAULTS['step']:,})")
-    parser.add_argument("--max",       type=int,   help=f"Maximum tokens to test (default: {_DEFAULTS['max']:,})")
-    parser.add_argument("--threshold", type=float, help=f"Stop if used memory exceeds this GB (default: {_DEFAULTS['threshold']})")
-    parser.add_argument("--timeout",   type=int,   help=f"Request timeout in seconds (default: {_DEFAULTS['timeout']})")
-    parser.add_argument("--no-jtop",   action="store_true", help="Skip jtop memory readings (if not on Jetson)")
+    parser.add_argument("--config",       help="Path to .ini config file")
+    parser.add_argument("--url",          help="llama-server base URL")
+    parser.add_argument("--model",        help="Model alias (required in router mode)")
+    parser.add_argument("--start",        type=int,   help=f"Starting token count (default: {_DEFAULTS['start']:,})")
+    parser.add_argument("--step",         type=int,   help=f"Token increment per step (default: {_DEFAULTS['step']:,})")
+    parser.add_argument("--max",          type=int,   help=f"Maximum tokens to test (default: {_DEFAULTS['max']:,})")
+    parser.add_argument("--threshold",    type=float, help=f"Stop if used memory exceeds this GB (default: {_DEFAULTS['threshold']})")
+    parser.add_argument("--timeout",      type=int,   help=f"Request timeout in seconds (default: {_DEFAULTS['timeout']})")
+    parser.add_argument("--image-width",  type=int,   help=f"Synthetic image width in pixels (default: {_DEFAULTS['image_width']})")
+    parser.add_argument("--image-height", type=int,   help=f"Synthetic image height in pixels (default: {_DEFAULTS['image_height']})")
+    parser.add_argument("--no-jtop",      action="store_true", help="Skip jtop memory readings (if not on Jetson)")
     args = parser.parse_args()
 
-    # Load ini if provided, then layer: CLI > ini > defaults
     ini = load_ini(args.config) if args.config else {}
 
-    url       = args.url       if args.url       is not None else ini.get("url")
-    model     = args.model     if args.model     is not None else ini.get("model", "")
-    start     = args.start     if args.start     is not None else int(ini.get("start",     _DEFAULTS["start"]))
-    step      = args.step      if args.step      is not None else int(ini.get("step",      _DEFAULTS["step"]))
-    max_tok   = args.max       if args.max       is not None else int(ini.get("max",       _DEFAULTS["max"]))
-    threshold = args.threshold if args.threshold is not None else float(ini.get("threshold", _DEFAULTS["threshold"]))
-    timeout   = args.timeout   if args.timeout   is not None else int(ini.get("timeout",   _DEFAULTS["timeout"]))
+    url          = args.url          if args.url          is not None else ini.get("url")
+    model        = args.model        if args.model        is not None else ini.get("model", "")
+    start        = args.start        if args.start        is not None else int(ini.get("start",        _DEFAULTS["start"]))
+    step         = args.step         if args.step         is not None else int(ini.get("step",         _DEFAULTS["step"]))
+    max_tok      = args.max          if args.max          is not None else int(ini.get("max",          _DEFAULTS["max"]))
+    threshold    = args.threshold    if args.threshold    is not None else float(ini.get("threshold",  _DEFAULTS["threshold"]))
+    timeout      = args.timeout      if args.timeout      is not None else int(ini.get("timeout",      _DEFAULTS["timeout"]))
+    image_width  = args.image_width  if args.image_width  is not None else int(ini.get("image_width",  _DEFAULTS["image_width"]))
+    image_height = args.image_height if args.image_height is not None else int(ini.get("image_height", _DEFAULTS["image_height"]))
 
     if not url:
         parser.error("'url' is required — pass --url or set it in a --config .ini file")
@@ -208,129 +302,172 @@ CLI flags override values in the config file.
         print("ERROR: llama-server is not responding at /health. Is it running?")
         sys.exit(1)
 
-    print("Test mode:")
-    print("  [1] Cold prefill — rebuild prompt each step, no cache (measures worst-case memory)")
-    print("  [2] Incremental  — extend prompt each step, reuse KV cache (faster, lower memory)")
+    print("Prefill mode:")
+    print("  [1] Cold       — rebuild prompt each step, no cache (worst-case memory)")
+    print("  [2] Incremental — extend prompt each step, reuse KV cache (faster)")
     while True:
         choice = input("Choice [1/2]: ").strip()
         if choice in ("1", "2"):
             break
     incremental = choice == "2"
+
+    print()
+    print("Content mode:")
+    print("  [1] Text only")
+    print("  [2] Image + text  — one synthetic image injected per request")
+    print("  [3] Compare       — runs text-only then image+text each step, shows delta")
+    while True:
+        content_choice = input("Choice [1/2/3]: ").strip()
+        if content_choice in ("1", "2", "3"):
+            break
     print()
 
-    col = "{:<10} {:<12} {:<12} {:<12} {:<10} {:<8}"
-    print(col.format("Tokens", "Used GB", "GPU sh GB", "Free GB", "Time (s)", "Status"))
-    print("-" * 70)
+    use_image   = content_choice in ("2", "3")
+    compare     = content_choice == "3"
 
-    results = []
+    # Generate image and measure its token cost once upfront
+    image_b64    = None
+    image_tokens = 0
+    if use_image:
+        print(f"  Generating {image_width}×{image_height} test image...", end="", flush=True)
+        image_b64 = make_test_image(image_width, image_height)
+        image_tokens = tokenize("[img-1]", image_b64=image_b64, timeout=timeout)
+        print(f" {image_tokens:,} tokens\n")
+
+    col = "{:<10} {:<12} {:<12} {:<12} {:<10} {:<8}"
+    if compare:
+        print(col.format("Tokens", "Used GB", "GPU sh GB", "Free GB", "Time (s)", "Type"))
+        print(f"  {'─'*66}")
+    else:
+        print(col.format("Tokens", "Used GB", "GPU sh GB", "Free GB", "Time (s)", "Status"))
+        print("-" * 70)
+
+    results      = []
     last_success = 0
-    prompt = ""
+    text_prompt  = ""
 
     target = start
     while target <= max_tok:
 
+        # ── build / extend text prompt ────────────────────────────────────────
         print(f"  tokenizing {target:,} token prompt...", end="", flush=True)
-        if incremental:
-            extra_tokens = target - (results[-1]["actual_tokens"] if results else 0)
-            extra_reps = (extra_tokens // CHUNK_TOKENS) + 10
-            prompt += FILL_CHUNK * extra_reps
+        if incremental and not compare:
+            prev_tokens  = results[-1]["actual_tokens"] if results else 0
+            extra_tokens = target - prev_tokens - (image_tokens if use_image else 0)
+            extra_reps   = (extra_tokens // CHUNK_TOKENS) + 10
+            text_prompt += FILL_CHUNK * extra_reps
         else:
-            prompt = build_prompt(target)
-        actual_tokens = tokenize(prompt, timeout=timeout)
+            text_prompt = build_prompt(target, reserve_tokens=image_tokens if use_image else 0)
+
+        if use_image:
+            full_prompt = "[img-1]\n" + text_prompt
+            actual_tokens = tokenize(full_prompt, image_b64=image_b64, timeout=timeout)
+        else:
+            full_prompt   = text_prompt
+            actual_tokens = tokenize(full_prompt, timeout=timeout)
         print(f" got {actual_tokens:,}", flush=True)
 
+        # trim if over by more than 500
         if actual_tokens > target + 500:
-            while actual_tokens > target and len(prompt) > len(FILL_CHUNK):
-                prompt = prompt[:-len(FILL_CHUNK)]
+            while actual_tokens > target and len(text_prompt) > len(FILL_CHUNK):
+                text_prompt    = text_prompt[:-len(FILL_CHUNK)]
                 actual_tokens -= CHUNK_TOKENS
+            full_prompt = ("[img-1]\n" + text_prompt) if use_image else text_prompt
 
-        if not args.no_jtop:
-            used_before, _, _ = get_memory_gb()
+        # ── compare mode: run text-only first, then image+text ────────────────
+        if compare:
+            text_only_prompt = build_prompt(target)
+            text_only_tokens = tokenize(text_only_prompt, timeout=timeout)
+
+            print(f"  {'─'*66}")
+            print(f"  text-only:")
+            result_text = run_step(
+                text_only_prompt, None, target, text_only_tokens,
+                False, threshold, timeout, args.no_jtop, "  " + col,
+            )
+            if result_text is None:
+                break
+
+            print(f"  image+text:")
+            result_img = run_step(
+                full_prompt, image_b64, target, actual_tokens,
+                False, threshold, timeout, args.no_jtop, "  " + col,
+            )
+            if result_img is None:
+                break
+
+            if result_text["success"] and result_img["success"]:
+                delta = result_img["used_gb"] - result_text["used_gb"]
+                print(f"  Memory delta (image vs text): {delta:+.2f} GB")
+
+            result_text["content"] = "text"
+            result_img["content"]  = "image"
+            results.append(result_text)
+            results.append(result_img)
+
+            if not result_text["success"] or not result_img["success"]:
+                print(f"\nSTOP: Request failed at {target:,} tokens.")
+                break
+
+            if result_img["used_gb"] >= threshold:
+                print(f"\nSTOP: Memory {result_img['used_gb']:.1f} GB hit threshold "
+                      f"{threshold} GB after {target:,} token request.")
+                break
+
+        # ── single mode (text-only or image+text) ─────────────────────────────
         else:
-            used_before = 0.0
+            result = run_step(
+                full_prompt, image_b64 if use_image else None,
+                target, actual_tokens,
+                incremental, threshold, timeout, args.no_jtop, col,
+            )
+            if result is None:
+                break
 
-        if used_before >= threshold:
-            print(f"\nSTOP: Memory {used_before:.1f} GB already at/above threshold "
-                  f"{threshold} GB before sending request.")
-            break
+            results.append(result)
 
-        t_start = time.time()
-        response = send_completion(prompt, cache=incremental, timeout=timeout)
-        elapsed = time.time() - t_start
+            if not result["success"]:
+                print(f"\nSTOP: Request failed at {target:,} tokens.")
+                break
 
-        if not args.no_jtop:
-            used_after, gpu_after, free_after = get_memory_gb()
-        else:
-            used_after = gpu_after = free_after = 0.0
+            last_success = result["actual_tokens"]
 
-        if response is not None:
-            tokens_evaluated = response.get("tokens_evaluated", actual_tokens)
-            status = "OK"
-            last_success = tokens_evaluated
-            print(col.format(
-                f"{tokens_evaluated:,}",
-                f"{used_after:.2f}",
-                f"{gpu_after:.2f}",
-                f"{free_after:.2f}",
-                f"{elapsed:.1f}",
-                status,
-            ))
-            results.append({
-                "target_tokens": target,
-                "actual_tokens": tokens_evaluated,
-                "used_gb":       used_after,
-                "gpu_shared_gb": gpu_after,
-                "free_gb":       free_after,
-                "total_gb":      used_after,
-                "elapsed_s":     elapsed,
-                "success":       True,
-            })
             if len(results) >= 2:
-                prev = results[-2]
+                prev      = results[-2]
                 gb_delta  = results[-1]["used_gb"] - prev["used_gb"]
                 tok_delta = results[-1]["actual_tokens"] - prev["actual_tokens"]
                 if gb_delta > 0 and tok_delta > 0:
                     gb_per_tok    = gb_delta / tok_delta
-                    headroom      = threshold - used_after
-                    predicted_max = int(tokens_evaluated + headroom / gb_per_tok)
+                    headroom      = threshold - result["used_gb"]
+                    predicted_max = int(result["actual_tokens"] + headroom / gb_per_tok)
                     print(f"  Predicted max: ~{predicted_max:,} tokens "
                           f"({gb_per_tok*1000:.3f} MB/tok, {headroom:.2f} GB headroom)")
-        else:
-            status = "FAIL"
-            print(col.format(
-                f"{target:,}",
-                f"{used_after:.2f}",
-                f"{gpu_after:.2f}",
-                f"{free_after:.2f}",
-                f"{elapsed:.1f}",
-                status,
-            ))
-            results.append({
-                "target_tokens": target,
-                "actual_tokens": actual_tokens,
-                "used_gb":       used_after,
-                "gpu_shared_gb": gpu_after,
-                "free_gb":       free_after,
-                "total_gb":      used_after,
-                "elapsed_s":     elapsed,
-                "success":       False,
-            })
-            print(f"\nSTOP: Request failed at {target:,} tokens.")
-            break
 
-        if used_after >= threshold:
-            print(f"\nSTOP: Memory {used_after:.1f} GB hit threshold "
-                  f"{threshold} GB after {target:,} token request.")
-            break
+            if result["used_gb"] >= threshold:
+                print(f"\nSTOP: Memory {result['used_gb']:.1f} GB hit threshold "
+                      f"{threshold} GB after {target:,} token request.")
+                break
 
         target += step
 
+    # ── summary ───────────────────────────────────────────────────────────────
     print(f"\n{'='*70}")
     print(f"  Results summary")
     print(f"{'='*70}")
-    print(f"  Last successful context: {last_success:,} tokens")
 
-    if results:
+    if compare:
+        text_results  = [r for r in results if r.get("content") == "text"  and r["success"]]
+        image_results = [r for r in results if r.get("content") == "image" and r["success"]]
+        if text_results and image_results:
+            avg_delta = sum(
+                i["used_gb"] - t["used_gb"]
+                for t, i in zip(text_results, image_results)
+            ) / len(text_results)
+            print(f"  Steps completed: {len(text_results)}")
+            print(f"  Avg memory delta (image vs text): {avg_delta:+.2f} GB")
+            print(f"  Image size: {image_width}×{image_height}px ({image_tokens:,} tokens)")
+    else:
+        print(f"  Last successful context: {last_success:,} tokens")
         successful = [r for r in results if r["success"]]
         failed     = [r for r in results if not r["success"]]
         if successful:
@@ -347,14 +484,16 @@ CLI flags override values in the config file.
     with open(out_file, "w") as f:
         json.dump({
             "config": {
-                "url":       url,
-                "model":     model,
-                "start":     start,
-                "step":      step,
-                "max":       max_tok,
-                "threshold": threshold,
-                "timeout":   timeout,
-                "timestamp": datetime.now().isoformat(),
+                "url":          url,
+                "model":        model,
+                "start":        start,
+                "step":         step,
+                "max":          max_tok,
+                "threshold":    threshold,
+                "timeout":      timeout,
+                "image_width":  image_width,
+                "image_height": image_height,
+                "timestamp":    datetime.now().isoformat(),
             },
             "results": results,
         }, f, indent=2)
