@@ -22,6 +22,7 @@ import base64
 import configparser
 import io
 import json
+import re
 import socket
 import time
 import sys
@@ -132,19 +133,44 @@ def send_completion(
     timeout: int = _DEFAULTS["timeout"],
 ) -> dict | None:
     try:
-        body = {
-            "prompt":       prompt,
-            "n_predict":    1,
-            "cache_prompt": cache,
-            "temperature":  0.0,
-        }
-        if MODEL_NAME:
-            body["model"] = MODEL_NAME
         if images:
-            body["image_data"] = [{"data": b64, "id": i + 1} for i, b64 in enumerate(images)]
-        r = _session.post(f"{LLAMA_URL}/completion", json=body, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
+            # Qwen3-VL (and most modern VLMs) require the chat template to emit
+            # the correct vision tokens — route through /v1/chat/completions.
+            # Strip [img-N] placeholders; images go in the content array directly.
+            text = re.sub(r"\[img-\d+\]\n?", "", prompt).strip()
+            content: list[dict] = [
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
+                for b64 in images
+            ]
+            if text:
+                content.append({"type": "text", "text": text})
+            body: dict = {
+                "model":       MODEL_NAME,
+                "messages":    [{"role": "user", "content": content}],
+                "max_tokens":  1,
+                "temperature": 0.0,
+            }
+            if cache:
+                body["cache_prompt"] = True
+            r = _session.post(f"{LLAMA_URL}/v1/chat/completions", json=body, timeout=timeout)
+            r.raise_for_status()
+            data = r.json()
+            return {
+                "tokens_evaluated": data.get("usage", {}).get("prompt_tokens", 0),
+                "content":          data.get("choices", [{}])[0].get("message", {}).get("content", ""),
+            }
+        else:
+            body = {
+                "prompt":       prompt,
+                "n_predict":    1,
+                "cache_prompt": cache,
+                "temperature":  0.0,
+            }
+            if MODEL_NAME:
+                body["model"] = MODEL_NAME
+            r = _session.post(f"{LLAMA_URL}/completion", json=body, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
     except requests.exceptions.Timeout:
         print(f"  [timeout after {timeout}s]")
     except requests.exceptions.HTTPError as e:
@@ -351,6 +377,10 @@ CLI flags override values in the config file.
             sys.exit(1)
         image_tokens = resp.get("tokens_evaluated", 0)
         print(f" {image_tokens:,} tokens per image\n")
+        if image_tokens < 50:
+            print(f"ERROR: image token count ({image_tokens}) is too low — "
+                  f"model may not support vision or the image placeholder format is wrong.")
+            sys.exit(1)
 
     col = "{:<10} {:<12} {:<12} {:<12} {:<10} {:<8}"
     print(col.format("Tokens", "Used GB", "GPU sh GB", "Free GB", "Time (s)", "Status"))
