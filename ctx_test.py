@@ -161,13 +161,13 @@ CLI flags override values in the config file.
     # Load ini if provided, then layer: CLI > ini > defaults
     ini = load_ini(args.config) if args.config else {}
 
-    url       = args.url       or ini.get("url")
-    model     = args.model     or ini.get("model", "")
-    start     = args.start     or int(ini.get("start",     _DEFAULTS["start"]))
-    step      = args.step      or int(ini.get("step",      _DEFAULTS["step"]))
-    max_tok   = args.max       or int(ini.get("max",       _DEFAULTS["max"]))
-    threshold = args.threshold or float(ini.get("threshold", _DEFAULTS["threshold"]))
-    timeout   = args.timeout   or int(ini.get("timeout",   _DEFAULTS["timeout"]))
+    url       = args.url       if args.url       is not None else ini.get("url")
+    model     = args.model     if args.model     is not None else ini.get("model", "")
+    start     = args.start     if args.start     is not None else int(ini.get("start",     _DEFAULTS["start"]))
+    step      = args.step      if args.step      is not None else int(ini.get("step",      _DEFAULTS["step"]))
+    max_tok   = args.max       if args.max       is not None else int(ini.get("max",       _DEFAULTS["max"]))
+    threshold = args.threshold if args.threshold is not None else float(ini.get("threshold", _DEFAULTS["threshold"]))
+    timeout   = args.timeout   if args.timeout   is not None else int(ini.get("timeout",   _DEFAULTS["timeout"]))
 
     if not url:
         parser.error("'url' is required — pass --url or set it in a --config .ini file")
