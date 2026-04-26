@@ -34,7 +34,7 @@ _DEFAULTS = {
     "step":      8_000,
     "max":       256_000,
     "threshold": 58.0,
-    "timeout":   300,
+    "timeout":   1800,
 }
 
 # ── jtop memory helper ────────────────────────────────────────────────────────
