@@ -267,6 +267,16 @@ CLI flags override values in the config file.
                 "elapsed_s":     elapsed,
                 "success":       True,
             })
+            if len(results) >= 2:
+                prev = results[-2]
+                gb_delta  = results[-1]["used_gb"] - prev["used_gb"]
+                tok_delta = results[-1]["actual_tokens"] - prev["actual_tokens"]
+                if gb_delta > 0 and tok_delta > 0:
+                    gb_per_tok    = gb_delta / tok_delta
+                    headroom      = threshold - used_after
+                    predicted_max = int(tokens_evaluated + headroom / gb_per_tok)
+                    print(f"  Predicted max: ~{predicted_max:,} tokens "
+                          f"({gb_per_tok*1000:.3f} MB/tok, {headroom:.2f} GB headroom)")
         else:
             status = "FAIL"
             print(col.format(
