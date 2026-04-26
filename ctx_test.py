@@ -302,24 +302,37 @@ CLI flags override values in the config file.
         print("ERROR: llama-server is not responding at /health. Is it running?")
         sys.exit(1)
 
-    print("Prefill mode:")
-    print("  [1] Cold       — rebuild prompt each step, no cache (worst-case memory)")
-    print("  [2] Incremental — extend prompt each step, reuse KV cache (faster)")
-    while True:
-        choice = input("Choice [1/2]: ").strip()
-        if choice in ("1", "2"):
-            break
+    _PREFILL_MAP = {"cold": "1", "incremental": "2"}
+    _CONTENT_MAP = {"text": "1", "image+text": "2", "multi-image": "3"}
+
+    ini_prefill = ini.get("prefill_mode", "").lower()
+    if ini_prefill in _PREFILL_MAP:
+        choice = _PREFILL_MAP[ini_prefill]
+        print(f"Prefill mode: {ini_prefill} (from config)")
+    else:
+        print("Prefill mode:")
+        print("  [1] Cold        — rebuild prompt each step, no cache (worst-case memory)")
+        print("  [2] Incremental — extend prompt each step, reuse KV cache (faster)")
+        while True:
+            choice = input("Choice [1/2]: ").strip()
+            if choice in ("1", "2"):
+                break
     incremental = choice == "2"
 
-    print()
-    print("Content mode:")
-    print("  [1] Text only")
-    print("  [2] Image + text  — one synthetic image + text fill per request")
-    print("  [3] Multi-image   — scale image count each step, no text (worst-case)")
-    while True:
-        content_choice = input("Choice [1/2/3]: ").strip()
-        if content_choice in ("1", "2", "3"):
-            break
+    ini_content = ini.get("content_mode", "").lower()
+    if ini_content in _CONTENT_MAP:
+        content_choice = _CONTENT_MAP[ini_content]
+        print(f"Content mode: {ini_content} (from config)")
+    else:
+        print()
+        print("Content mode:")
+        print("  [1] Text only")
+        print("  [2] Image + text  — one synthetic image + text fill per request")
+        print("  [3] Multi-image   — scale image count each step, no text (worst-case)")
+        while True:
+            content_choice = input("Choice [1/2/3]: ").strip()
+            if content_choice in ("1", "2", "3"):
+                break
     print()
 
     use_image   = content_choice in ("2", "3")
