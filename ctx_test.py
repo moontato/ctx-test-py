@@ -175,12 +175,12 @@ def main():
         
         # Memory before request
         if not args.no_jtop:
-            used_before, gpu_before, free_before = get_memory_gb()
+            used_before, _, _ = get_memory_gb()
         else:
-            used_before = gpu_before = free_before = 0.0
+            used_before = 0.0
 
         # Check threshold before even sending
-        total_before = used_before + gpu_before
+        total_before = used_before
         if total_before >= args.threshold:
             print(f"\nSTOP: Memory {total_before:.1f} GB already at/above threshold "
                   f"{args.threshold} GB before sending request.")
@@ -197,7 +197,7 @@ def main():
         else:
             used_after = gpu_after = free_after = 0.0
 
-        total_after = used_after + gpu_after
+        total_after = used_after
 
         if response is not None:
             tokens_evaluated = response.get("tokens_evaluated", actual_tokens)
