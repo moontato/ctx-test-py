@@ -1,8 +1,8 @@
-# ctx-test-py
+# ctx-test-unified-py
 
 Finds the practical context length limit of a llama-server instance by sending progressively larger prompts and recording memory usage at each step. Stops when a request fails, times out, or memory exceeds a safety threshold.
 
-Designed for Jetson Orin (unified CPU/GPU memory), but works on any machine running llama-server.
+Designed for systems with unified CPU/GPU memory (Jetson Orin). Not intended for discrete GPU systems where VRAM and system RAM are separate pools.
 
 ## Requirements
 
@@ -14,8 +14,8 @@ Designed for Jetson Orin (unified CPU/GPU memory), but works on any machine runn
 
 ```bash
 # Clone
-git clone https://github.com/moontato/ctx-test-py
-cd ctx-test-py
+git clone https://github.com/moontato/ctx-test-unified-py
+cd ctx-test-unified-py
 
 # Install dependencies (system Python — recommended on Jetson)
 pip3 install requests --break-system-packages
@@ -67,10 +67,10 @@ To call the script from anywhere as `ctx_test`:
 
 ```bash
 # Make executable
-chmod +x /path/to/ctx-test-py/ctx_test.py
+chmod +x /path/to/ctx-test-unified-py/ctx_test.py
 
 # Symlink into a directory already on your PATH
-sudo ln -s /path/to/ctx-test-py/ctx_test.py /usr/local/bin/ctx_test
+sudo ln -s /path/to/ctx-test-unified-py/ctx_test.py /usr/local/bin/ctx_test
 ```
 
 Then from anywhere:
