@@ -23,6 +23,7 @@ from datetime import datetime
 # ── Config ────────────────────────────────────────────────────────────────────
 
 LLAMA_URL    = "http://127.0.0.1:8080"
+MODEL_NAME   = ""          # required in router mode — set to your model alias
 START_TOKENS = 8_000       # first test size
 STEP_TOKENS  = 8_000       # increment per step
 MAX_TOKENS   = 256_000     # hard ceiling (your ctx-size)
@@ -60,9 +61,12 @@ def get_memory_gb():
 def tokenize(text: str) -> int:
     """Return actual token count from llama-server /tokenize endpoint."""
     try:
+        body = {"content": text}
+        if MODEL_NAME:
+            body["model"] = MODEL_NAME
         r = requests.post(
             f"{LLAMA_URL}/tokenize",
-            json={"content": text},
+            json=body,
             timeout=30,
         )
         r.raise_for_status()
@@ -83,14 +87,17 @@ def send_completion(prompt: str, timeout: int = REQUEST_TIMEOUT) -> dict | None:
     Returns the response dict on success, None on failure.
     """
     try:
+        body = {
+            "prompt":        prompt,
+            "n_predict":     1,
+            "cache_prompt":  False,
+            "temperature":   0.0,
+        }
+        if MODEL_NAME:
+            body["model"] = MODEL_NAME
         r = requests.post(
             f"{LLAMA_URL}/completion",
-            json={
-                "prompt":        prompt,
-                "n_predict":     1,
-                "cache_prompt":  False,
-                "temperature":   0.0,
-            },
+            json=body,
             timeout=timeout,
         )
         r.raise_for_status()
@@ -115,6 +122,7 @@ def check_health() -> bool:
 def main():
     parser = argparse.ArgumentParser(description="Test llama-server context limits")
     parser.add_argument("--url",       default=LLAMA_URL,          help="llama-server base URL")
+    parser.add_argument("--model",     default=MODEL_NAME,         help="Model alias (required in router mode)")
     parser.add_argument("--start",     type=int, default=START_TOKENS,   help="Starting token count")
     parser.add_argument("--step",      type=int, default=STEP_TOKENS,    help="Token increment per step")
     parser.add_argument("--max",       type=int, default=MAX_TOKENS,     help="Maximum tokens to test")
@@ -122,8 +130,9 @@ def main():
     parser.add_argument("--no-jtop",   action="store_true",         help="Skip jtop (if not on Jetson)")
     args = parser.parse_args()
 
-    global LLAMA_URL
-    LLAMA_URL = args.url
+    global LLAMA_URL, MODEL_NAME
+    LLAMA_URL  = args.url
+    MODEL_NAME = args.model
 
     print(f"\n{'='*70}")
     print(f"  llama-server context limit test")
