@@ -43,16 +43,18 @@ def get_memory_gb():
         from jtop import jtop
         with jtop() as jetson:
             if jetson.ok():
-                mem = jetson.memory
-                # mem fields are in KB
-                used_kb   = mem.get("used",   0)
-                shared_kb = mem.get("shared", 0)
-                free_kb   = mem.get("free",   0)
+                ram = jetson.memory["RAM"]
+                # values are in KB
+                used_kb   = ram["used"]
+                shared_kb = ram["shared"]
+                free_kb   = ram["free"]
                 return (
                     used_kb   / 1024 / 1024,
                     shared_kb / 1024 / 1024,
                     free_kb   / 1024 / 1024,
                 )
+    except ModuleNotFoundError:
+        print("  [jtop error: module not found — run with system python3, or use --no-jtop]")
     except Exception as e:
         print(f"  [jtop error: {e}]")
     return (0.0, 0.0, 0.0)
@@ -159,8 +161,10 @@ def main():
     while target <= args.max:
 
         # Build and verify prompt token count
+        print(f"  tokenizing {target:,} token prompt...", end="", flush=True)
         prompt = build_prompt(target)
         actual_tokens = tokenize(prompt)
+        print(f" got {actual_tokens:,}", flush=True)
 
         # Trim or pad to get closer to target
         if actual_tokens > target + 500:
