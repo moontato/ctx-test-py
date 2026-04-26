@@ -19,9 +19,11 @@ from __future__ import annotations
 import argparse
 import configparser
 import json
+import socket
 import time
 import sys
 import requests
+from requests.adapters import HTTPAdapter
 from datetime import datetime
 
 # Internal prompt-building constants — not user config
@@ -83,6 +85,22 @@ def build_prompt(target_tokens: int) -> str:
     reps = (target_tokens // CHUNK_TOKENS) + 10
     return FILL_CHUNK * reps
 
+class _KeepaliveAdapter(HTTPAdapter):
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs["socket_options"] = [
+            (socket.SOL_SOCKET,  socket.SO_KEEPALIVE,  1),
+            (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE,  60),
+            (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10),
+            (socket.IPPROTO_TCP, socket.TCP_KEEPCNT,   6),
+        ]
+        super().init_poolmanager(*args, **kwargs)
+
+
+_session = requests.Session()
+_session.mount("http://",  _KeepaliveAdapter())
+_session.mount("https://", _KeepaliveAdapter())
+
+
 def send_completion(prompt: str, cache: bool = False, timeout: int = _DEFAULTS["timeout"]) -> dict | None:
     try:
         body = {
@@ -93,7 +111,7 @@ def send_completion(prompt: str, cache: bool = False, timeout: int = _DEFAULTS["
         }
         if MODEL_NAME:
             body["model"] = MODEL_NAME
-        r = requests.post(f"{LLAMA_URL}/completion", json=body, timeout=timeout)
+        r = _session.post(f"{LLAMA_URL}/completion", json=body, timeout=timeout)
         r.raise_for_status()
         return r.json()
     except requests.exceptions.Timeout:
