@@ -12,6 +12,7 @@ Requirements:
     pip install jetson-stats requests --break-system-packages
 """
 
+from __future__ import annotations
 import argparse
 import hashlib
 import json
